@@ -27,10 +27,13 @@ typedef struct {
   cudaStream_t stream;
   // Tracking whether the stream is created simplifies cleanup code.
   int stream_created;
-  // The grid size is computed based on the matrix width.
-  dim3 grid_size;
+  // The grid size is computed based on the matrix width. We use an array
+  // rather than a dim3 here in order to allow memset on PluginState. (The Z
+  // dimension is always 1.)
+  int grid_size[2];
   // The block size is determined by the thread_count setting in the config.
-  dim3 block_size;
+  // (See the note on grid_size.)
+  int block_size[2];
   // Set this to nonzero in order to not copy input or output matrices, apart
   // from during initialization.
   int skip_copy;
@@ -84,7 +87,7 @@ static int AllocateMemory(PluginState *state) {
   int i, j, width, block_count;
   size_t size, smids_size;
   width = state->matrix_width;
-  block_count = state->grid_size.x * state->grid_size.y;
+  block_count = state->grid_size[0] * state->grid_size[1];
 
   // Allocate host and device memory for block times.
   size = block_count * 2 * sizeof(uint64_t);
@@ -199,28 +202,26 @@ static void* Initialize(InitializationParameters *params) {
   }
   matrix_width = state->matrix_width;
 
-  state->block_size.x = params->block_dim[0];
+  state->block_size[0] = params->block_dim[0];
   if (params->block_dim[1] == 1) {
     // Print a warning here; the old behavior was different so this will help
     // catch and update configs expecting the old version. (e.g. we probably
     // want to use 32x32 blocks rather than 1024x1 blocks!)
     printf("Warning! Specified a 1-D block dim for matrix multiply.\n");
     printf("HACK: Defaulting to 32x32.\n");
-    state->block_size.x = 32;
-    state->block_size.y = 32;
+    state->block_size[0] = 32;
+    state->block_size[1] = 32;
   }
-  state->block_size.y = params->block_dim[1];
-  state->block_size.z = 1;
+  state->block_size[1] = params->block_dim[1];
 
   // Compute the grid size from the block size and matrix width.
-  blocks_wide = matrix_width / state->block_size.x;
-  if ((matrix_width % state->block_size.x) != 0) blocks_wide++;
-  blocks_tall = matrix_width / state->block_size.y;
-  if ((matrix_width % state->block_size.y) != 0) blocks_tall++;
+  blocks_wide = matrix_width / state->block_size[0];
+  if ((matrix_width % state->block_size[0]) != 0) blocks_wide++;
+  blocks_tall = matrix_width / state->block_size[1];
+  if ((matrix_width % state->block_size[1]) != 0) blocks_tall++;
 
-  state->grid_size.x = blocks_wide;
-  state->grid_size.y = blocks_tall;
-  state->grid_size.z = 1;
+  state->grid_size[0] = blocks_wide;
+  state->grid_size[1] = blocks_tall;
 
   // Create the stream and fill in boilerplate for reporting to the framework.
   if (!CheckCUDAError(CreateCUDAStreamWithPriorityAndMask(
@@ -230,8 +231,8 @@ static void* Initialize(InitializationParameters *params) {
   }
   state->stream_created = 1;
   state->kernel_times.kernel_name = "matrix_multiply";
-  state->kernel_times.thread_count = state->block_size.x * state->block_size.y;
-  state->kernel_times.block_count = state->grid_size.x * state->grid_size.y;
+  state->kernel_times.thread_count = state->block_size[0] * state->block_size[1];
+  state->kernel_times.block_count = state->grid_size[0] * state->grid_size[1];
   state->kernel_times.shared_memory = 0;
 
   // Allocate the matrices and initialize the input matrices
@@ -245,7 +246,7 @@ static void* Initialize(InitializationParameters *params) {
 // Reset block times and copy input matrices.
 static int CopyIn(void *data) {
   PluginState *state = (PluginState *) data;
-  int block_count = state->grid_size.x * state->grid_size.y;
+  int block_count = state->grid_size[0] * state->grid_size[1];
 
   // Reset block times
   size_t size = block_count * 2 * sizeof(uint64_t);
@@ -312,8 +313,15 @@ __global__ void MatrixMultiplyKernel(float *a, float *b, float *c, int width,
 static int Execute(void *data) {
   PluginState *state = (PluginState *) data;
   state->kernel_times.cuda_launch_times[0] = CurrentSeconds();
+  dim3 block_size, grid_size;
+  grid_size.x = state->grid_size[0];
+  grid_size.y = state->grid_size[1];
+  grid_size.z = 1;
+  block_size.x = state->block_size[0];
+  block_size.y = state->block_size[1];
+  block_size.z = 1;
 
-  MatrixMultiplyKernel<<<state->grid_size, state->block_size, 0, state->stream>>>(
+  MatrixMultiplyKernel<<<grid_size, block_size, 0, state->stream>>>(
     state->d_a, state->d_b, state->d_c, state->matrix_width,
     state->device_block_times, state->device_block_smids);
 
@@ -326,7 +334,7 @@ static int Execute(void *data) {
 // Copy the block times to the host, along with the result matrix.
 static int CopyOut(void *data, TimingInformation *times) {
   PluginState *state = (PluginState *) data;
-  int block_count = state->grid_size.x * state->grid_size.y;
+  int block_count = state->grid_size[0] * state->grid_size[1];
   size_t size;
 
 
